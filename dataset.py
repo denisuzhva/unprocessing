@@ -1,105 +1,94 @@
-# coding=utf-8
-# Copyright 2019 The Google Research Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# https://github.com/aasharma90/UnprocessDenoising_PyTorch/blob/master/dataloader/load_data.py
 
-"""Creates a Dataset of unprocessed images for denoising.
+import os
+import torch
+import torch.utils.data as data
+import torch
+import torchvision.transforms as transforms
+import random
+from PIL import Image, ImageOps
+import numpy as np
+import random
+from . import unprocess
 
-Unprocessing Images for Learned Raw Denoising
-http://timothybrooks.com/tech/unprocessing
-"""
+IMG_EXTENSIONS = [
+    '.jpg', '.JPG', '.jpeg', '.JPEG',
+    '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP',
+]
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
 
-import tensorflow as tf
-
-from unprocessing import unprocess
+def default_loader(path):
+    return Image.open(path).convert('RGB')
 
 
-def read_jpg(filename):
-  """Reads an 8-bit JPG file from disk and normalizes to [0, 1]."""
-  image_file = tf.read_file(filename)
-  image = tf.image.decode_jpeg(image_file, channels=3)
-  white_level = 255.0
-  return tf.cast(image, tf.float32) / white_level
+class loadImgs(data.Dataset):
+    
+    def __init__(self, args, image_in, loader=default_loader, mode='train'):
+        self.image_in = image_in
+        self.loader   = loader
+        self.args     = args
+        self.mode     = mode
 
+    def align_to_64(self, img):
+        pre_width   = img.size[0]
+        pre_height  = img.size[1]
+        new_width   = min(2048, int(pre_width /64)*64) # Capped at 2048
+        new_height  = min(2048, int(pre_height/64)*64) # Capped at 2048
+        center_crop_= transforms.Compose([transforms.CenterCrop((new_height, new_width))])
+        img_aligned = center_crop_(img)
+        return img_aligned
 
-def is_large_enough(image, height, width):
-  """Checks if `image` is at least as large as `height` by `width`."""
-  image.shape.assert_has_rank(3)
-  shape = tf.shape(image)
-  image_height = shape[0]
-  image_width = shape[1]
-  return tf.logical_and(
-      tf.greater_equal(image_height, height),
-      tf.greater_equal(image_width, width))
+    def __getitem__(self, index):
+        image_in  = self.image_in[index]
 
+        if self.mode == 'train':
+            image_in_img = self.loader(self.args.train_dir + '/' + image_in)
+            if self.args.load_size is not None:
+                load_size = self.args.load_size.strip('[]').split(', ')
+                load_size = [int(item) for item in load_size]
+                image_in_img = image_in_img.resize((load_size[1], load_size[0]))
+            if self.args.crop_size is not None:
+                w, h      = image_in_img.size
+                crop_size = self.args.crop_size.strip('[]').split(', ')
+                crop_size = [int(item) for item in crop_size]
+                th, tw    = crop_size[0], crop_size[1]
+                x1 = random.randint(0, w - tw)
+                y1 = random.randint(0, h - th)
+                image_in_img = image_in_img.crop((x1, y1, x1 + tw, y1 + th))
+            hflip = random.random() < 0.5
+            if hflip:
+                image_in_img = transforms.functional.hflip(image_in_img)
+            vflip = random.random() < 0.5
+            if vflip:
+                image_in_img = transforms.functional.vflip(image_in_img)
+            rotate= random.random() < 0.5
+            if rotate:
+                degree = random.randint(-20, 20)
+                image_in_img = transforms.functional.rotate(image_in_img, degree)
+        elif self.mode == 'val' or self.mode == 'test':
+            image_in_img = self.loader(self.args.test_dir + '/' + image_in)
+            image_in_img = self.align_to_64(image_in_img)
+        else:
+            print('Unrecognized mode! Please select either "train" or "val"')
+            raise NotImplementedError
 
-def augment(image, height, width):
-  """Randomly flips and crops `images` to `height` by `width`."""
-  size = [height, width, tf.shape(image)[-1]]
-  image = tf.random_crop(image, size)
-  image = tf.image.random_flip_left_right(image)
-  image = tf.image.random_flip_up_down(image)
-  return image
+        t_list = [transforms.ToTensor()]
+        composed_transform    = transforms.Compose(t_list)
+        image_in_img = composed_transform(image_in_img)
 
+        # Adding unprocessing to raw here!
+        image_in_img, metadata = unprocess.unprocess(image_in_img)
+        shot_noise, read_noise = unprocess.random_noise_levels()
+        noisy_img              = unprocess.add_noise(image_in_img, shot_noise, read_noise)
+        # Approximation of variance is calculated using noisy image (rather than clean
+        # image), since that is what will be avaiable during evaluation.
+        variance               = shot_noise * noisy_img + read_noise
+        inputs                 = {'noisy_img': noisy_img, 'variance': variance}
+        inputs.update(metadata)
+        labels = image_in_img
+        return inputs, labels
 
-def create_example(image):
-  """Creates training example of inputs and labels from `image`."""
-  image.shape.assert_is_compatible_with([None, None, 3])
-  image, metadata = unprocess.unprocess(image)
-  shot_noise, read_noise = unprocess.random_noise_levels()
-  noisy_img = unprocess.add_noise(image, shot_noise, read_noise)
-  # Approximation of variance is calculated using noisy image (rather than clean
-  # image), since that is what will be avaiable during evaluation.
-  variance = shot_noise * noisy_img + read_noise
-
-  inputs = {
-      'noisy_img': noisy_img,
-      'variance': variance,
-  }
-  inputs.update(metadata)
-  labels = image
-  return inputs, labels
-
-
-def create_dataset_fn(dir_pattern, height, width, batch_size):
-  """Wrapper for creating a dataset function for unprocessing.
-
-  Args:
-    dir_pattern: A string representing source data directory glob.
-    height: Height to crop images.
-    width: Width to crop images.
-    batch_size: Number of training examples per batch.
-
-  Returns:
-    Nullary function that returns a Dataset.
-  """
-  if height % 16 != 0 or width % 16 != 0:
-    raise ValueError('`height` and `width` must be multiples of 16.')
-
-  def dataset_fn_():
-    """Creates a Dataset for unprocessing training."""
-    autotune = tf.data.experimental.AUTOTUNE
-
-    filenames = tf.data.Dataset.list_files(dir_pattern, shuffle=True).repeat()
-    images = filenames.map(read_jpg, num_parallel_calls=autotune)
-    images = images.filter(lambda x: is_large_enough(x, height, width))
-    images = images.map(
-        lambda x: augment(x, height, width), num_parallel_calls=autotune)
-    examples = images.map(create_example, num_parallel_calls=autotune)
-    return examples.batch(batch_size).prefetch(autotune)
-
-  return dataset_fn_
+    def __len__(self):
+        return len(self.image_in)
